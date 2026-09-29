@@ -6,10 +6,17 @@
 - 创建投票（2～4 个选项 + 指定参与组白名单 + 截止虚拟毫秒，归属当前轮次）
 - 组投票 / 改投（UNIQUE(poll_id, group_id) 保证每组只计一票，改投原地更新）
 - tick 结算：对「当前轮次、open、deadline_ms <= 虚拟时钟」的投票一次性
-  结算——最高票获胜，平票按选项创建顺序（seq 最小）决定，结果写回 polls 行；
+  结算——最高票获胜，平票按选项创建顺序（seq 最小）决定；获胜项、结算虚拟
+  毫秒与**各选项票数**在同一事务写回 polls/poll_options 行（tallies_state='
+  frozen'）；之后删除参与组只会级联删除其残余选票，读取一律取固定值，
+  刷新/重启/删组都展示结算当时的结果（option_tallies 是主持人/参与者
+  视图共用的唯一票数口径）；
   结算只数本轮票，且每条投票只结算一次（status open → settled）
+- 旧库恢复：已结算但 tallies_state IS NULL 的行由 recover_settled_tallies
+  从对应 poll_settled 事件恢复票数；事件缺失置 'unrecoverable'——保留
+  获胜项、明确标示票数不可恢复，绝不用残余选票伪造
 - 重置：未结算（open）投票作废（status → voided、票删除），已结算结果
-  按轮次保留不动
+  按轮次保留不动（含固定票数）
 
 暂停冻结截止计时由调用方保证：tick 只扫描 running 房间并以
 main.room_elapsed_ms（暂停取冻结值）作为当前虚拟毫秒；重启时 init_schema
@@ -18,6 +25,7 @@ main.room_elapsed_ms（暂停取冻结值）作为当前虚拟毫秒；重启时
 
 from __future__ import annotations
 
+import json
 import sqlite3
 import time
 from dataclasses import dataclass
@@ -25,6 +33,10 @@ from dataclasses import dataclass
 MIN_OPTIONS = 2
 MAX_OPTIONS = 4
 MAX_DEADLINE_SECONDS = 24 * 3600
+
+# polls.tallies_state 取值
+TALLIES_FROZEN = "frozen"                # 票数已在结算当时固定（或从结算事件恢复）
+TALLIES_UNRECOVERABLE = "unrecoverable"  # 旧库已结算行缺结算事件：保留获胜项，票数不可恢复
 
 
 class PollError(Exception):
@@ -175,10 +187,18 @@ def settle_due_polls(
                 tallies[row["option_id"]] = row["c"]
         # max 在票数相等时保留先遇到者；options 已按 seq 升序 → 平票取创建最早选项
         winner = max(options, key=lambda opt: (tallies[opt["id"]], -opt["seq"]))
+        # 结果固定化：状态、获胜项、各选项票数在同一事务写死。此后参与组被删
+        # 只会级联删除其选票，读取一律取固定值，绝不按残余选票重算（否则会出现
+        # 获胜项 0 票、他项 1 票的矛盾展示）。每条投票只在 open→settled 时写一次。
+        for opt in options:
+            conn.execute(
+                "UPDATE poll_options SET settled_votes = ? WHERE id = ?",
+                (tallies[opt["id"]], opt["id"]),
+            )
         conn.execute(
-            "UPDATE polls SET status = 'settled', winner_option_id = ?, settled_at_ms = ?"
-            " WHERE id = ? AND status = 'open'",
-            (winner["id"], elapsed_ms, poll["id"]),
+            "UPDATE polls SET status = 'settled', winner_option_id = ?, settled_at_ms = ?,"
+            " tallies_state = ? WHERE id = ? AND status = 'open'",
+            (winner["id"], elapsed_ms, TALLIES_FROZEN, poll["id"]),
         )
         conn.commit()
         fresh = conn.execute("SELECT * FROM polls WHERE id = ?", (poll["id"],)).fetchone()
@@ -215,3 +235,83 @@ def vote_of_group(conn: sqlite3.Connection, poll_id: int, group_id: int) -> sqli
         "SELECT * FROM poll_votes WHERE poll_id = ? AND group_id = ?",
         (poll_id, group_id),
     ).fetchone()
+
+
+def option_tallies(
+    conn: sqlite3.Connection, poll: sqlite3.Row
+) -> tuple[list[sqlite3.Row], dict[int, int | None], str | None]:
+    """读取一条投票的选项与各选项票数，主持人/参与者视图共用此唯一口径。
+
+    返回 (options, tallies, state)：
+
+    - 已结算且 tallies_state='frozen'：取 poll_options.settled_votes——结算当时
+      固定的票数；之后选票因参与组删除被级联清理也不受影响（重启/刷新一致）；
+    - 已结算且 tallies_state='unrecoverable'：旧库缺对应 poll_settled 事件，
+      保留 winner_option_id 但每选项票数为 None（读取方按「票数不可恢复」标示），
+      绝不按残余选票重算伪造；
+    - 未结算（open/voided，state 为 None）：按当前残余 poll_votes 实时统计
+      （voided 票已被重置删除，恒为 0）。
+    """
+    options = conn.execute(
+        "SELECT * FROM poll_options WHERE poll_id = ? ORDER BY seq", (poll["id"],)
+    ).fetchall()
+    state = poll["tallies_state"] if "tallies_state" in poll.keys() else None
+    if state == TALLIES_FROZEN:
+        return options, {o["id"]: (0 if o["settled_votes"] is None else o["settled_votes"])
+                         for o in options}, state
+    if state == TALLIES_UNRECOVERABLE:
+        return options, {o["id"]: None for o in options}, state
+    tallies = {o["id"]: 0 for o in options}
+    for row in conn.execute(
+        "SELECT option_id, COUNT(*) AS c FROM poll_votes WHERE poll_id = ? GROUP BY option_id",
+        (poll["id"],),
+    ):
+        if row["option_id"] in tallies:
+            tallies[row["option_id"]] = row["c"]
+    return options, tallies, None
+
+
+def recover_settled_tallies(conn: sqlite3.Connection) -> dict[int, str]:
+    """旧库升级恢复：为 tallies_state IS NULL 的已结算投票固定票数。
+
+    从该房间对应 poll_settled 事件（payload 即结算当时的主持人全量视图，
+    含 options[].id 与 tallies[{option_id,count}]）逐条恢复，写入
+    poll_options.settled_votes 并置 tallies_state='frozen'；事件缺失或载荷
+    损坏（缺某选项计数）时置 'unrecoverable'：winner_option_id 原样保留，
+    settled_votes 留 NULL，读取端明确标示票数不可恢复。
+
+    幂等：只挑 tallies_state IS NULL 的已结算行处理；新版本结算时必写
+    tallies_state，因此不会重复执行。返回 {poll_id: 恢复后的 state}。
+    """
+    pending = conn.execute(
+        "SELECT * FROM polls WHERE status = 'settled' AND tallies_state IS NULL"
+    ).fetchall()
+    recovered: dict[int, str] = {}
+    for poll in pending:
+        state = TALLIES_UNRECOVERABLE
+        event = conn.execute(
+            "SELECT payload FROM events WHERE room_id = ? AND type = 'poll_settled'"
+            " AND json_extract(payload, '$.id') = ? ORDER BY id LIMIT 1",
+            (poll["room_id"], poll["id"]),
+        ).fetchone()
+        if event is not None:
+            try:
+                payload = json.loads(event["payload"])
+                counts = {int(t["option_id"]): int(t["count"])
+                          for t in payload.get("tallies", [])}
+                options = conn.execute(
+                    "SELECT id FROM poll_options WHERE poll_id = ?", (poll["id"],)
+                ).fetchall()
+                if options and all(o["id"] in counts for o in options):
+                    for o in options:
+                        conn.execute(
+                            "UPDATE poll_options SET settled_votes = ? WHERE id = ?",
+                            (counts[o["id"]], o["id"]),
+                        )
+                    state = TALLIES_FROZEN
+            except (ValueError, TypeError, KeyError, json.JSONDecodeError):
+                state = TALLIES_UNRECOVERABLE
+        conn.execute("UPDATE polls SET tallies_state = ? WHERE id = ?", (state, poll["id"]))
+        recovered[poll["id"]] = state
+    conn.commit()
+    return recovered

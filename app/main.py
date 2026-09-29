@@ -187,23 +187,40 @@ def poll_option_public(option: sqlite3.Row) -> dict:
     return {"id": option["id"], "seq": option["seq"], "text": option["text"]}
 
 
+def poll_tallies_public(
+    options: list[sqlite3.Row], tallies: dict[int, int | None]
+) -> list[dict]:
+    """选项汇总序列化：已结算固定票数与未结算实时票数共用此格式。
+
+    count 为 None 表示票数不可恢复（旧库已结算但结算事件缺失），
+    主持人/参与者视图均以同一字段明确标示，绝不显示按残余选票重算的数字。"""
+    out = []
+    for opt in options:
+        n = tallies[opt["id"]]
+        out.append({"option_id": opt["id"],
+                    "count": n,
+                    "recoverable": n is not None})
+    return out
+
+
 def poll_host_view(poll: sqlite3.Row) -> dict:
     """主持人视野：选项、参与组白名单、逐组选票与选项汇总，全量下发。
 
     选票明细（哪一组投了哪个选项）只随主持人快照/事件下发；
     参与者视野走 poll_player_view，观察者完全拿不到投票。
+
+    已结算投票的票数取结算当时固定值（tallies_state=frozen 时）；
+    旧库缺结算事件时 count 为 None（recoverable=false）。未结算投票按
+    当前残余选票实时统计——删除参与组会级联删除其选票并移除其资格。
     """
-    options = pollmod.poll_options(db, poll["id"])
+    options, tallies, state = pollmod.option_tallies(db, poll)
     group_ids = pollmod.poll_group_ids(db, poll["id"])
     votes = []
-    tallies = {opt["id"]: 0 for opt in options}
     for row in db.execute(
         "SELECT group_id, option_id FROM poll_votes WHERE poll_id = ? ORDER BY group_id",
         (poll["id"],),
     ):
         votes.append({"group_id": row["group_id"], "option_id": row["option_id"]})
-        if row["option_id"] in tallies:
-            tallies[row["option_id"]] += 1
     return {
         "id": poll["id"],
         "question": poll["question"],
@@ -212,10 +229,9 @@ def poll_host_view(poll: sqlite3.Row) -> dict:
         "status": poll["status"],               # open | settled | voided
         "group_ids": group_ids,
         "options": [poll_option_public(o) for o in options],
-        "votes": votes,                         # 逐组选票：[{group_id, option_id}]
-        "tallies": [
-            {"option_id": opt["id"], "count": tallies[opt["id"]]} for opt in options
-        ],
+        "votes": votes,                         # 逐组残余选票：[{group_id, option_id}]
+        "tallies": poll_tallies_public(options, tallies),
+        "tallies_state": state,                 # frozen | unrecoverable | null(未结算)
         "winner_option_id": poll["winner_option_id"],
         "settled_at_ms": poll["settled_at_ms"],
     }
@@ -223,8 +239,11 @@ def poll_host_view(poll: sqlite3.Row) -> dict:
 
 def poll_player_view(poll: sqlite3.Row, group_id: int) -> dict:
     """参与者视野：结算前只见自己的选择（无任何票数/他组信息），
-    结算后才看到获胜选项与选项汇总；作废投票只见作废状态。"""
-    options = pollmod.poll_options(db, poll["id"])
+    结算后才看到获胜选项与选项汇总；作废投票只见作废状态。
+
+    结算票数与主持人同口径取固定值（option_tallies 唯一来源），
+    因此参与组删除、页面刷新或服务重启后，双方看到的结果完全一致。"""
+    options, tallies, state = pollmod.option_tallies(db, poll)
     data = {
         "id": poll["id"],
         "question": poll["question"],
@@ -237,17 +256,11 @@ def poll_player_view(poll: sqlite3.Row, group_id: int) -> dict:
     vote = pollmod.vote_of_group(db, poll["id"], group_id)
     data["my_option_id"] = vote["option_id"] if vote is not None else None
     if poll["status"] == "settled":
-        # 结算后结果公开给参与组：获胜选项 + 汇总票数（仍不下发逐组选票明细）
-        tallies = {opt["id"]: 0 for opt in options}
-        for row in db.execute(
-            "SELECT option_id, COUNT(*) AS c FROM poll_votes WHERE poll_id = ? GROUP BY option_id",
-            (poll["id"],),
-        ):
-            if row["option_id"] in tallies:
-                tallies[row["option_id"]] = row["c"]
+        # 结算后结果公开给参与组：获胜选项 + 固定汇总票数（仍不下发逐组选票明细）
         data["winner_option_id"] = poll["winner_option_id"]
         data["settled_at_ms"] = poll["settled_at_ms"]
-        data["tallies"] = [{"option_id": oid, "count": n} for oid, n in tallies.items()]
+        data["tallies"] = poll_tallies_public(options, tallies)
+        data["tallies_state"] = state
     return data
 
 

@@ -817,16 +817,25 @@ function hostPollItem(poll) {
   meta.textContent = `参与组：${groups} · ${deadlineText(poll)}`;
   li.appendChild(meta);
 
-  // 选项与票数：投票中实时变化（每组只计一票，改投自动迁移）
+  // 选项与票数：投票中实时变化（每组只计一票，改投自动迁移）；
+  // 已结算票数为结算当时固定值（tallies_state='frozen'），删除参与组/重启均不变；
+  // tallies_state='unrecoverable'（旧库缺结算事件）时只标示票数不可恢复，绝不显示残余重算数。
   const tallies = poll.tallies || poll.options.map((o) => ({ option_id: o.id, count: 0 }));
   for (const opt of poll.options) {
     const row = document.createElement('div');
     row.className = 'poll-option-row';
-    const n = (tallies.find((t) => t.option_id === opt.id) || {}).count || 0;
+    const t = tallies.find((x) => x.option_id === opt.id) || {};
+    const n = t.count == null ? null : t.count;
     const winner = poll.status === 'settled' && opt.id === poll.winner_option_id;
-    row.textContent = `${winner ? '🏆 ' : ''}${opt.text}　${n} 票`;
+    row.textContent = `${winner ? '🏆 ' : ''}${opt.text}　${n === null ? '票数不可恢复' : `${n} 票`}`;
     if (winner) row.classList.add('poll-winner');
     li.appendChild(row);
+  }
+  if (poll.status === 'settled' && poll.tallies_state === 'unrecoverable') {
+    const note = document.createElement('div');
+    note.className = 'poll-meta';
+    note.textContent = '旧库记录缺少对应结算事件：获胜项保留，各项票数不可恢复（不按残余选票重算）。';
+    li.appendChild(note);
   }
 
   if (poll.status === 'open') {
@@ -892,15 +901,23 @@ function playerPollItem(poll) {
       btn.onclick = () => submitPollVote(poll, opt.id, btn);
       row.appendChild(btn);
     } else if (poll.status === 'settled') {
-      const n = (poll.tallies || []).find((t) => t.option_id === opt.id);
+      const t = (poll.tallies || []).find((x) => x.option_id === opt.id);
+      const count = t && t.count != null ? t.count : null;
       const winner = opt.id === poll.winner_option_id;
       if (winner) row.classList.add('poll-winner');
-      row.textContent = `${winner ? '🏆 ' : ''}${opt.text}　${n ? n.count : 0} 票`
+      row.textContent = `${winner ? '🏆 ' : ''}${opt.text}　`
+        + (count === null ? '票数不可恢复' : `${count} 票`)
         + (mine ? '（本组选择）' : '');
     } else {
       row.textContent = opt.text;
     }
     li.appendChild(row);
+  }
+  if (poll.status === 'settled' && poll.tallies_state === 'unrecoverable') {
+    const note = document.createElement('div');
+    note.className = 'poll-meta';
+    note.textContent = '旧库记录缺少对应结算事件：获胜项保留，各项票数不可恢复。';
+    li.appendChild(note);
   }
   if (poll.status === 'open' && pastDue) {
     const note = document.createElement('div');

@@ -328,12 +328,18 @@ DATABASE_PATH=./data/inject.db uvicorn app.main:app --reload --port 8000
 
 - **快照（主持人）**：`polls` 数组含**全部轮次**投票，每条为
   `{id, question, round, deadline_ms, status, group_ids, options:[{id,seq,text}],
-  votes:[{group_id,option_id}], tallies:[{option_id,count}], winner_option_id,
-  settled_at_ms}`；`status ∈ open | settled | voided`。
+  votes:[{group_id,option_id}], tallies:[{option_id,count,recoverable}],
+  tallies_state, winner_option_id, settled_at_ms}`；
+  `status ∈ open | settled | voided`。`settled` 时 `tallies_state` 为
+  `frozen`（票数为结算当时固定值）或 `unrecoverable`（旧库缺结算事件，
+  各项 `count=null, recoverable=false`，获胜项仍保留）；未结算时
+  `tallies_state=null`，`count` 为按残余选票实时统计值。`votes` 始终是
+  当前残余选票明细（删除参与组后该组行随级联消失），不参与已结算票数。
 - **快照（参与者）**：只含**当前轮次、白名单包含本组**的投票。`open` 时为
   `{id, question, round, deadline_ms, status, options, my_option_id}`——
   不含票数、获胜者与他组选择；`settled` 时额外带 `winner_option_id /
-  settled_at_ms / tallies`（结果公开，但仍无逐组 `votes`）。
+  settled_at_ms / tallies / tallies_state`（结果公开，口径与主持人完全一致，
+  但仍无逐组 `votes`）。
 - **观察者快照与任何 `poll_*` 事件均不下发**（投票对观察者完全不可见）。
 - **事件**：
   - `poll_created`：主持人收全量投票对象；白名单参与组收**脱敏 open 载荷**
@@ -342,23 +348,62 @@ DATABASE_PATH=./data/inject.db uvicorn app.main:app --reload --port 8000
     `poll` 全量对象（逐组选票），**只有投票的本组**参与者收脱敏三字段，
     同白名单的他组与观察者收不到。
   - `poll_settled`：tick 在 `state_lock` 内一次性结算后广播。主持人收全量
-    （含 `winner_option_id / tallies / votes / settled_at_ms`）；白名单参与组
-    由服务端按组定向投递脱敏结果载荷（本组已投选项 + 获胜结果与汇总，无逐组
-    明细）；观察者收不到。断线重连以快照为准，不会因错过事件而看不到结果。
+    （含 `winner_option_id / tallies / tallies_state / votes / settled_at_ms`）；
+    白名单参与组由服务端按组定向投递脱敏结果载荷（本组已投选项 + 获胜结果与
+    固定汇总，无逐组明细）；观察者收不到。断线重连以快照为准，不会因错过
+    事件而看不到结果。
   - `poll_voided`：重置作废未结算投票时逐条广播，**仅主持人可见**
     （`{id, round, status:'voided'}`）；参与者在 `reset` 事件时清空本轮投票。
-- **结算口径**：`polls.status` 由 tick 从 `open` 原子置为 `settled` 并写回
-  `winner_option_id / settled_at_ms`，每条投票只结算一次（重复 tick、服务重启
-  均不重复结算）；票数只统计**本轮** `poll_votes`，最高票获胜，平票按
-  `poll_options.seq`（创建顺序）取最早者，全员零票取第一个选项。
+- **结算口径**：`polls.status` 由 tick 从 `open` 原子置为 `settled`，并在
+  **同一事务**写回 `winner_option_id / settled_at_ms / tallies_state='frozen'`
+  与各选项固定票数 `poll_options.settled_votes`；每条投票只结算一次
+  （重复 tick、服务重启均不重复结算）。计票只统计**本轮** `poll_votes`，
+  最高票获胜，平票按 `poll_options.seq`（创建顺序）取最早者，全员零票取
+  第一个选项。
+- **结算结果固定（本轮修复）**：结算后票数与获胜项不再依赖残余选票——
+  之后删除投过票的参与组（选票经外键级联删除）、页面刷新或服务重启，
+  主持人与仍有资格的参与组读到的都是**结算当时**的各选项票数与获胜项，
+  不会再出现「获胜项 0 票、另一项 1 票」的矛盾展示。读取统一走
+  `app.polls.option_tallies`：`frozen` 读固定列；未结算（`open/voided`）
+  才按当前 `poll_votes` 实时统计（删组即删其资格与选票的规则不变；
+  截止前改投、最高票获胜、平票按选项顺序决胜均不变）。
 - **持久化与轮次**：投票存于 `polls / poll_options / poll_groups / poll_votes`
   四表（`UNIQUE(poll_id, group_id)` 保证每组一票），均随 SQLite 持久化；
   截止是相对本轮开始的**虚拟毫秒**，暂停冻结、重启先冻结 running 房间。
-  重置删除未结算投票的选票并置 `voided`，已结算行与其选票按 `round` 保留；
-  删除参与组/房间经外键级联清理白名单、选票与投票。
-- 旧库启动时自动迁移：投票四表为全新表，由 `CREATE TABLE IF NOT EXISTS`
-  直接补齐（含 `idx_polls_room` 等索引），既有演练视为没有任何投票。
+  重置删除未结算投票的选票并置 `voided`，已结算行（含固定票数）按 `round`
+  保留；删除参与组/房间经外键级联清理白名单、选票与投票。
+- **旧库迁移（本轮新增）**：启动时为旧库补 `polls.tallies_state` 与
+  `poll_options.settled_votes` 列，并对所有「已结算但未固定」的行，从其
+  对应 `poll_settled` 事件（载荷含结算当时 `tallies`）恢复票数、置
+  `frozen`；事件缺失或载荷损坏时保留 `winner_option_id` 不动，置
+  `tallies_state='unrecoverable'`，API 返回各项 `count=null,
+  recoverable=false` 并由页面标示「票数不可恢复」，**绝不按残余选票重算**。
+  恢复幂等，重复启动不会二次处理。
 - 投票事件**不进入复盘包导出**（与观察分享事件同类，整类不在导出白名单）。
+
+### 结算结果读取调用示例（主持人与参与组一致）
+
+结果只通过现有 HTTP API 读取，双方字段口径一致（参与者少逐组 `votes`）：
+
+```bash
+# 主持人（房间码即主持人凭证）：快照内 polls[].tallies / winner_option_id
+curl -s http://localhost:8000/api/rooms/ROOMCODE |
+  python3 -c 'import json,sys; print([(p["id"], p["status"], p["tallies_state"],
+      p["winner_option_id"], p["tallies"]) for p in json.load(sys.stdin)["polls"]])'
+
+# 仍有资格的参与组（凭组加入码）：只含当前轮次、白名单含本组的投票
+curl -s http://localhost:8000/api/join/GROUPJOINCODE |
+  python3 -c 'import json,sys; print([(p["id"], p.get("tallies_state"),
+      p.get("winner_option_id"), p.get("tallies")) for p in json.load(sys.stdin)["polls"]])'
+```
+
+结算正常时两条路径对同一投票都返回 `tallies_state="frozen"` 与相同的
+`tallies=[{option_id,count,recoverable:true},…]`；旧库缺结算事件时均返回
+`tallies_state="unrecoverable"`、每项 `count=null, recoverable=false`，
+获胜项 `winner_option_id` 照常给出。删除参与组用现有接口
+`DELETE /api/rooms/{房间码}/groups/{group_id}`，随后再次读取上述两接口即可
+验证已结算票数不变；WebSocket 推送（主持人与参与组均连 `/ws/{房间码或组加入码}`）
+的 `poll_settled` 事件载荷与上述字段相同，重连以快照为准。
 
 ## 应急车辆申请 API 与事件
 

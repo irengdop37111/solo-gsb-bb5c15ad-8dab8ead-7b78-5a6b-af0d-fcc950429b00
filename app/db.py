@@ -113,6 +113,9 @@ CREATE TABLE IF NOT EXISTS polls (
     status        TEXT NOT NULL DEFAULT 'open',      -- open | settled | voided
     winner_option_id INTEGER,                        -- 结算获胜选项；平票按选项创建顺序（seq 最小）
     settled_at_ms INTEGER,                           -- 结算时的虚拟时钟毫秒
+    tallies_state TEXT,                              -- 结算票数状态：frozen=已按结算事件固定；
+                                                     -- unrecoverable=旧库缺结算事件，票数不可恢复；
+                                                     -- NULL=尚未结算（open/voided，票数按残余选票实时算）
     created_at    REAL NOT NULL
 );
 
@@ -121,6 +124,8 @@ CREATE TABLE IF NOT EXISTS poll_options (
     poll_id INTEGER NOT NULL REFERENCES polls(id) ON DELETE CASCADE,
     seq     INTEGER NOT NULL,                        -- 选项创建顺序：平票决胜键
     text    TEXT NOT NULL,
+    settled_votes INTEGER,                           -- 结算当时固定的本选项票数（tallies_state=frozen 时有效）；
+                                                     -- NULL=未结算或票数不可恢复（不得用残余选票伪造）
     UNIQUE (poll_id, seq)
 );
 
@@ -228,34 +233,47 @@ def _migrate(conn: sqlite3.Connection) -> None:
     SCHEMA 中的 CREATE TABLE IF NOT EXISTS 直接在旧库补齐，无需额外迁移；
     旧库既有演练视为没有任何锚点与投票。重置不删锚点与已结算投票，
     升级后仍按所属轮次保留。
+    polls.tallies_state / poll_options.settled_votes 是后续为「结算票数固定化」
+    补的列：旧库需 ALTER 补列，并由 recover_settled_tallies 从对应 poll_settled
+    事件恢复票数；事件缺失的已结算行置 tallies_state='unrecoverable'，
+    绝不用残余选票重算。
     应急车辆申请表 vehicle_pools / vehicle_requests 同为全新表，随 SCHEMA
     在旧库直接补齐；旧库演练视为尚未创建车辆池、没有任何申请。
     现场情报核验板表 intel_claims / intel_claim_groups / intel_reports
     同为全新表，随 SCHEMA 在旧库直接补齐；旧库演练视为没有任何命题与报告。
     """
-    table = conn.execute(
+    if conn.execute(
         "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'cards'"
-    ).fetchone()
-    if table is None:
-        return  # 全新库：由 SCHEMA 一并建好，无需迁移
-    cols = {row["name"] for row in conn.execute("PRAGMA table_info(cards)")}
-    # 下列列在 SCHEMA 建索引（idx_cards_due 等）时必须已存在，旧库先补齐。
-    # 最早版本的 cards 表只有 id/room_id/seq/trigger_seconds/title/content，
-    # revealed/revealed_at_ms 与 group_id 等都是后续演进加入的。
-    if "revealed" not in cols:
-        conn.execute("ALTER TABLE cards ADD COLUMN revealed INTEGER NOT NULL DEFAULT 0")
-    if "revealed_at_ms" not in cols:
-        conn.execute("ALTER TABLE cards ADD COLUMN revealed_at_ms INTEGER")
-    if "group_id" not in cols:
-        conn.execute("ALTER TABLE cards ADD COLUMN group_id INTEGER REFERENCES groups(id)")
-    if "depends_on_card_id" not in cols:
-        conn.execute("ALTER TABLE cards ADD COLUMN depends_on_card_id INTEGER REFERENCES cards(id)")
-    if "gate_timeout_seconds" not in cols:
-        conn.execute("ALTER TABLE cards ADD COLUMN gate_timeout_seconds INTEGER")
-    if "timed_out" not in cols:
-        conn.execute("ALTER TABLE cards ADD COLUMN timed_out INTEGER NOT NULL DEFAULT 0")
-    if "answers_locked" not in cols:
-        conn.execute("ALTER TABLE cards ADD COLUMN answers_locked INTEGER NOT NULL DEFAULT 0")
+    ).fetchone() is not None:
+        cols = {row["name"] for row in conn.execute("PRAGMA table_info(cards)")}
+        # 下列列在 SCHEMA 建索引（idx_cards_due 等）时必须已存在，旧库先补齐。
+        # 最早版本的 cards 表只有 id/room_id/seq/trigger_seconds/title/content，
+        # revealed/revealed_at_ms 与 group_id 等都是后续演进加入的。
+        if "revealed" not in cols:
+            conn.execute("ALTER TABLE cards ADD COLUMN revealed INTEGER NOT NULL DEFAULT 0")
+        if "revealed_at_ms" not in cols:
+            conn.execute("ALTER TABLE cards ADD COLUMN revealed_at_ms INTEGER")
+        if "group_id" not in cols:
+            conn.execute("ALTER TABLE cards ADD COLUMN group_id INTEGER REFERENCES groups(id)")
+        if "depends_on_card_id" not in cols:
+            conn.execute("ALTER TABLE cards ADD COLUMN depends_on_card_id INTEGER REFERENCES cards(id)")
+        if "gate_timeout_seconds" not in cols:
+            conn.execute("ALTER TABLE cards ADD COLUMN gate_timeout_seconds INTEGER")
+        if "timed_out" not in cols:
+            conn.execute("ALTER TABLE cards ADD COLUMN timed_out INTEGER NOT NULL DEFAULT 0")
+        if "answers_locked" not in cols:
+            conn.execute("ALTER TABLE cards ADD COLUMN answers_locked INTEGER NOT NULL DEFAULT 0")
+    # 结算票数固定化补列：旧库可能存在「带 polls 表但缺新列」的版本，
+    # 缺失才补（全新库/更早版本由 SCHEMA 的 CREATE TABLE IF NOT EXISTS 直接建出含列版本）。
+    if conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'polls'"
+    ).fetchone() is not None:
+        poll_cols = {r["name"] for r in conn.execute("PRAGMA table_info(polls)")}
+        if "tallies_state" not in poll_cols:
+            conn.execute("ALTER TABLE polls ADD COLUMN tallies_state TEXT")
+        opt_cols = {r["name"] for r in conn.execute("PRAGMA table_info(poll_options)")}
+        if "settled_votes" not in opt_cols:
+            conn.execute("ALTER TABLE poll_options ADD COLUMN settled_votes INTEGER")
     conn.commit()
 
 
@@ -310,3 +328,7 @@ def init_schema(conn: sqlite3.Connection) -> None:
              now),
         )
     conn.commit()
+    # 旧库已结算投票：在新列就位后，从对应 poll_settled 事件恢复固定票数；
+    # 事件缺失的行置 unrecoverable（保留获胜项、标示票数不可恢复）。
+    from .polls import recover_settled_tallies
+    recover_settled_tallies(conn)

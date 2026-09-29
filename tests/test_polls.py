@@ -370,6 +370,224 @@ def test_legacy_schema_includes_poll_tables():
     print("ok: schema creates poll tables/indexes and UNIQUE(poll, group)")
 
 
+def test_settled_tallies_frozen_after_group_delete_and_restart():
+    """结算结果固定化：结算时写死各选项票数与获胜项。
+
+    之后删除投过票的参与组（选票级联删除）、重新连接（模拟重启），
+    option_tallies 读到的仍是结算当时的票数，绝不按残余选票重算——
+    不允许出现「获胜项 0 票、另一项 1 票」的矛盾结果。
+    """
+    import json as _json
+    with tempfile.TemporaryDirectory() as d:
+        path = os.path.join(d, "t.db")
+        conn = open_db(path)
+        rid, _ = make_room(conn)
+        g1 = add_group(conn, rid, "红队", "RRR101")
+        g2 = add_group(conn, rid, "蓝队", "BBB102")
+        # A 得 2 票获胜（红队+蓝队）
+        poll = make_poll(conn, rid, ["A", "B"], [g1, g2], 10_000)
+        oa, ob = pm.poll_options(conn, poll["id"])
+        pm.cast_vote(conn, poll, g1, oa["id"])
+        pm.cast_vote(conn, poll, g2, oa["id"])
+        res = pm.settle_due_polls(conn, rid, 0, 10_000)
+        assert res[0].tallies == {oa["id"]: 2, ob["id"]: 0}
+        # 结算时同事务固定票数
+        fixed = conn.execute("SELECT id, settled_votes FROM poll_options ORDER BY seq").fetchall()
+        assert [(r["id"], r["settled_votes"]) for r in fixed] == [(oa["id"], 2), (ob["id"], 0)]
+        # 模拟 main.ticker：落一条与结算视图同形的 poll_settled 事件（旧库恢复的来源）
+        def view(c):
+            p = c.execute("SELECT * FROM polls WHERE id=?", (poll["id"],)).fetchone()
+            opts, tallies, state = pm.option_tallies(c, p)
+            return {
+                "id": p["id"], "options": [{"id": o["id"]} for o in opts],
+                "tallies": [{"option_id": o["id"], "count": tallies[o["id"]]} for o in opts],
+                "winner_option_id": p["winner_option_id"],
+            }
+        conn.execute(
+            "INSERT INTO events (room_id,type,payload,created_at) VALUES (?,?,?,?)",
+            (rid, "poll_settled", _json.dumps(view(conn), ensure_ascii=False), time.time()))
+        conn.commit()
+
+        # 删除投过票的参与组：选票与白名单级联删除
+        conn.execute("DELETE FROM groups WHERE id=?", (g1,))
+        conn.commit()
+        assert conn.execute(
+            "SELECT COUNT(*) c FROM poll_votes WHERE poll_id=?", (poll["id"],)
+        ).fetchone()["c"] == 1
+        p = conn.execute("SELECT * FROM polls WHERE id=?", (poll["id"],)).fetchone()
+        opts, tallies, state = pm.option_tallies(conn, p)
+        assert state == pm.TALLIES_FROZEN
+        assert tallies == {oa["id"]: 2, ob["id"]: 0}  # 仍是结算当时：获胜项 2 票
+        assert p["winner_option_id"] == oa["id"]
+        # 再删第二组：残余票 0 张，固定票数仍不变
+        conn.execute("DELETE FROM groups WHERE id=?", (g2,))
+        conn.commit()
+        p = conn.execute("SELECT * FROM polls WHERE id=?", (poll["id"],)).fetchone()
+        _, tallies, _ = pm.option_tallies(conn, p)
+        assert tallies == {oa["id"]: 2, ob["id"]: 0}
+        conn.close()
+
+        # 模拟重启：重新连接 + init_schema（不得改动已固定票数）
+        conn2 = sqlite3.connect(path)
+        conn2.row_factory = sqlite3.Row
+        conn2.execute("PRAGMA foreign_keys=ON")
+        dbmod.init_schema(conn2)
+        p = conn2.execute("SELECT * FROM polls WHERE id=?", (poll["id"],)).fetchone()
+        opts, tallies, state = pm.option_tallies(conn2, p)
+        assert state == pm.TALLIES_FROZEN
+        assert tallies == {oa["id"]: 2, ob["id"]: 0}
+        assert p["winner_option_id"] == oa["id"]
+        conn2.close()
+    print("ok: settled tallies frozen against group deletion and restart")
+
+
+def test_unsettled_poll_group_delete_keeps_existing_rules():
+    """未结算投票维持原规则：删组级联删除其资格（白名单）与选票，票数按残余实时算。"""
+    with tempfile.TemporaryDirectory() as d:
+        conn = open_db(os.path.join(d, "t.db"))
+        rid, _ = make_room(conn)
+        g1 = add_group(conn, rid, "红队", "RRR111")
+        g2 = add_group(conn, rid, "蓝队", "BBB112")
+        poll = make_poll(conn, rid, ["A", "B"], [g1, g2], 60_000)
+        oa, ob = pm.poll_options(conn, poll["id"])
+        pm.cast_vote(conn, poll, g1, oa["id"])
+        pm.cast_vote(conn, poll, g2, ob["id"])
+        conn.execute("DELETE FROM groups WHERE id=?", (g1,))
+        conn.commit()
+        assert pm.poll_group_ids(conn, poll["id"]) == [g2]
+        p = conn.execute("SELECT * FROM polls WHERE id=?", (poll["id"],)).fetchone()
+        opts, tallies, state = pm.option_tallies(conn, p)
+        assert state is None  # 未结算：无固定状态
+        assert tallies == {oa["id"]: 0, ob["id"]: 1}  # 残余选票实时口径
+        # 结算仍按残余选票、最高票获胜、平票按选项顺序：B 一票获胜
+        res = pm.settle_due_polls(conn, rid, 0, 60_000)
+        assert len(res) == 1 and res[0].winner["id"] == ob["id"]
+        assert res[0].tallies == {oa["id"]: 0, ob["id"]: 1}
+        conn.close()
+    print("ok: unsettled poll delete group removes eligibility and vote; settle unchanged")
+
+
+def test_legacy_recovery_from_settle_event_and_missing_event_marker():
+    """旧库已结算行：从对应 poll_settled 事件恢复票数；事件缺失则保留获胜项、
+    标示 tallies_state='unrecoverable'（count 全 None），不得用残余选票伪造。"""
+    import json as _json
+    with tempfile.TemporaryDirectory() as d:
+        path = os.path.join(d, "t.db")
+        conn = open_db(path)
+        rid, _ = make_room(conn)
+        g1 = add_group(conn, rid, "红队", "RRR121")
+        g2 = add_group(conn, rid, "蓝队", "BBB122")
+
+        # 旧行 1：有结算事件（A=1 B=2，B 获胜），升级前红队已被删、残余只剩蓝队投 B
+        p1 = make_poll(conn, rid, ["A", "B"], [g1, g2], 10_000)
+        a1, b1 = pm.poll_options(conn, p1["id"])
+        payload1 = {"id": p1["id"], "options": [{"id": a1["id"]}, {"id": b1["id"]}],
+                    "tallies": [{"option_id": a1["id"], "count": 1},
+                                {"option_id": b1["id"], "count": 2}],
+                    "winner_option_id": b1["id"]}
+        conn.execute(
+            "INSERT INTO events (room_id,type,payload,created_at) VALUES (?,?,?,?)",
+            (rid, "poll_settled", _json.dumps(payload1, ensure_ascii=False), time.time()))
+        conn.execute(
+            "UPDATE polls SET status='settled', winner_option_id=?, settled_at_ms=10000,"
+            " tallies_state=NULL WHERE id=?", (b1["id"], p1["id"]))
+        conn.execute("DELETE FROM poll_votes WHERE poll_id=? AND group_id=?", (p1["id"], g1))
+        conn.execute("UPDATE poll_options SET settled_votes=NULL WHERE poll_id=?", (p1["id"],))
+        conn.commit()
+
+        # 旧行 2：无结算事件（事件缺失），残余选票只有 A 一票，但获胜项是 B
+        p2 = make_poll(conn, rid, ["A", "B"], [g1, g2], 20_000)
+        a2, b2 = pm.poll_options(conn, p2["id"])
+        pm.cast_vote(conn, p2, g2, a2["id"])  # 残余：A 一票
+        conn.execute(
+            "UPDATE polls SET status='settled', winner_option_id=?, settled_at_ms=20000,"
+            " tallies_state=NULL WHERE id=?", (b2["id"], p2["id"]))
+        conn.commit()
+
+        recovered = pm.recover_settled_tallies(conn)
+        assert recovered == {p1["id"]: pm.TALLIES_FROZEN, p2["id"]: pm.TALLIES_UNRECOVERABLE}
+
+        p1r = conn.execute("SELECT * FROM polls WHERE id=?", (p1["id"],)).fetchone()
+        opts, tallies, state = pm.option_tallies(conn, p1r)
+        assert state == pm.TALLIES_FROZEN
+        assert tallies == {a1["id"]: 1, b1["id"]: 2}  # 从事件恢复，非残余的 0/1
+        assert p1r["winner_option_id"] == b1["id"]
+
+        p2r = conn.execute("SELECT * FROM polls WHERE id=?", (p2["id"],)).fetchone()
+        opts, tallies, state = pm.option_tallies(conn, p2r)
+        assert state == pm.TALLIES_UNRECOVERABLE
+        assert tallies == {a2["id"]: None, b2["id"]: None}  # 不按残余 A=1 伪造
+        assert p2r["winner_option_id"] == b2["id"]           # 获胜项保留
+
+        # 幂等：再跑一次（经 init_schema）不重复处理、结果不变
+        dbmod.init_schema(conn)
+        p2r = conn.execute("SELECT * FROM polls WHERE id=?", (p2["id"],)).fetchone()
+        _, tallies, state = pm.option_tallies(conn, p2r)
+        assert state == pm.TALLIES_UNRECOVERABLE
+        assert all(n is None for n in tallies.values())
+        conn.close()
+    print("ok: legacy settled rows recover tallies from event; missing event marked unrecoverable")
+
+
+def test_migration_adds_tally_columns_to_legacy_poll_db():
+    """旧库（含 polls/poll_options 但缺新列）迁移：ALTER 补列后事件恢复可跑。"""
+    with tempfile.TemporaryDirectory() as d:
+        path = os.path.join(d, "t.db")
+        conn = sqlite3.connect(path)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA foreign_keys=ON")
+        # 模拟旧版本 schema：polls/poll_options 不含 tallies_state / settled_votes
+        conn.executescript("""
+        CREATE TABLE rooms (id INTEGER PRIMARY KEY AUTOINCREMENT, code TEXT NOT NULL UNIQUE,
+            name TEXT NOT NULL DEFAULT '', status TEXT NOT NULL DEFAULT 'idle',
+            elapsed_ms INTEGER NOT NULL DEFAULT 0, last_resume_at REAL, created_at REAL NOT NULL);
+        CREATE TABLE groups (id INTEGER PRIMARY KEY AUTOINCREMENT, room_id INTEGER NOT NULL,
+            name TEXT NOT NULL, join_code TEXT NOT NULL UNIQUE, created_at REAL NOT NULL);
+        CREATE TABLE polls (id INTEGER PRIMARY KEY AUTOINCREMENT, room_id INTEGER NOT NULL,
+            question TEXT NOT NULL, round INTEGER NOT NULL, deadline_ms INTEGER NOT NULL,
+            status TEXT NOT NULL DEFAULT 'open', winner_option_id INTEGER,
+            settled_at_ms INTEGER, created_at REAL NOT NULL);
+        CREATE TABLE poll_options (id INTEGER PRIMARY KEY AUTOINCREMENT, poll_id INTEGER NOT NULL,
+            seq INTEGER NOT NULL, text TEXT NOT NULL, UNIQUE(poll_id, seq));
+        CREATE TABLE events (id INTEGER PRIMARY KEY AUTOINCREMENT, room_id INTEGER NOT NULL,
+            type TEXT NOT NULL, payload TEXT NOT NULL, created_at REAL NOT NULL);
+        """)
+        now = time.time()
+        rid = conn.execute(
+            "INSERT INTO rooms (code,name,status,created_at) VALUES ('MIG01','旧','idle',?)",
+            (now,)).lastrowid
+        gid = conn.execute(
+            "INSERT INTO groups (room_id,name,join_code,created_at) VALUES (?,?,?,?)",
+            (rid, "红队", "MMM001", now)).lastrowid
+        pid = conn.execute(
+            "INSERT INTO polls (room_id,question,round,deadline_ms,status,created_at)"
+            " VALUES (?,?,?,?,?,?)", (rid, "q", 0, 10000, "settled", now)).lastrowid
+        oa = conn.execute(
+            "INSERT INTO poll_options (poll_id,seq,text) VALUES (?,?,?)", (pid, 0, "A")).lastrowid
+        ob = conn.execute(
+            "INSERT INTO poll_options (poll_id,seq,text) VALUES (?,?,?)", (pid, 1, "B")).lastrowid
+        conn.execute("UPDATE polls SET winner_option_id=?, settled_at_ms=10000 WHERE id=?",
+                     (oa, pid))
+        conn.execute(
+            "INSERT INTO events (room_id,type,payload,created_at) VALUES (?,?,?,?)",
+            (rid, "poll_settled",
+             '{"id": %d, "tallies": [{"option_id": %d, "count": 3},'
+             ' {"option_id": %d, "count": 0}]}' % (pid, oa, ob), now))
+        conn.commit()
+        conn.close()
+
+        conn = sqlite3.connect(path)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA foreign_keys=ON")
+        dbmod.init_schema(conn)
+        poll = conn.execute("SELECT * FROM polls WHERE id=?", (pid,)).fetchone()
+        opts, tallies, state = pm.option_tallies(conn, poll)
+        assert state == pm.TALLIES_FROZEN
+        assert tallies == {oa: 3, ob: 0}
+        conn.close()
+    print("ok: legacy db migration adds tally columns and recovers tallies")
+
+
 if __name__ == "__main__":
     test_create_and_option_bounds()
     test_one_vote_per_group_and_change()
@@ -381,4 +599,8 @@ if __name__ == "__main__":
     test_cascade_delete_group_and_room()
     test_restart_freezes_running_room_and_polls_survive()
     test_legacy_schema_includes_poll_tables()
+    test_settled_tallies_frozen_after_group_delete_and_restart()
+    test_unsettled_poll_group_delete_keeps_existing_rules()
+    test_legacy_recovery_from_settle_event_and_missing_event_marker()
+    test_migration_adds_tally_columns_to_legacy_poll_db()
     print("ALL POLL TESTS PASSED")
