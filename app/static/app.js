@@ -817,16 +817,27 @@ function hostPollItem(poll) {
   meta.textContent = `参与组：${groups} · ${deadlineText(poll)}`;
   li.appendChild(meta);
 
-  // 选项与票数：投票中实时变化（每组只计一票，改投自动迁移）
+  // 选项与票数：投票中实时变化（每组只计一票，改投自动迁移）；
+  // 已结算展示结算当时固定的票数（删组/重启均不变）。旧库缺结算事件时
+  // tallies 为 null 且 tallies_recoverable=false，明确标示票数不可恢复，
+  // 绝不显示由残余选票凑出的 0 票。
   const tallies = poll.tallies || poll.options.map((o) => ({ option_id: o.id, count: 0 }));
+  const countsUnrecoverable = poll.status === 'settled' && poll.tallies_recoverable === false;
   for (const opt of poll.options) {
     const row = document.createElement('div');
     row.className = 'poll-option-row';
-    const n = (tallies.find((t) => t.option_id === opt.id) || {}).count || 0;
     const winner = poll.status === 'settled' && opt.id === poll.winner_option_id;
-    row.textContent = `${winner ? '🏆 ' : ''}${opt.text}　${n} 票`;
+    row.textContent = countsUnrecoverable
+      ? `${winner ? '🏆 ' : ''}${opt.text}　票数不可恢复`
+      : `${winner ? '🏆 ' : ''}${opt.text}　${((tallies.find((t) => t.option_id === opt.id) || {}).count) || 0} 票`;
     if (winner) row.classList.add('poll-winner');
     li.appendChild(row);
+  }
+  if (countsUnrecoverable) {
+    const warn = document.createElement('div');
+    warn.className = 'poll-meta poll-counts-missing';
+    warn.textContent = '该投票结算于旧版本且结算事件已缺失：保留获胜项，但各选项票数无法恢复，未按残余选票重算。';
+    li.appendChild(warn);
   }
 
   if (poll.status === 'open') {
@@ -892,15 +903,25 @@ function playerPollItem(poll) {
       btn.onclick = () => submitPollVote(poll, opt.id, btn);
       row.appendChild(btn);
     } else if (poll.status === 'settled') {
-      const n = (poll.tallies || []).find((t) => t.option_id === opt.id);
       const winner = opt.id === poll.winner_option_id;
       if (winner) row.classList.add('poll-winner');
-      row.textContent = `${winner ? '🏆 ' : ''}${opt.text}　${n ? n.count : 0} 票`
-        + (mine ? '（本组选择）' : '');
+      if (poll.tallies_recoverable === false) {
+        row.textContent = `${winner ? '🏆 ' : ''}${opt.text}　票数不可恢复`;
+      } else {
+        const n = (poll.tallies || []).find((t) => t.option_id === opt.id);
+        row.textContent = `${winner ? '🏆 ' : ''}${opt.text}　${n ? n.count : 0} 票`
+          + (mine ? '（本组选择）' : '');
+      }
     } else {
       row.textContent = opt.text;
     }
     li.appendChild(row);
+  }
+  if (poll.status === 'settled' && poll.tallies_recoverable === false) {
+    const warn = document.createElement('div');
+    warn.className = 'poll-meta poll-counts-missing';
+    warn.textContent = '该投票结算于旧版本且结算事件已缺失：获胜项保留，各选项票数无法恢复。';
+    li.appendChild(warn);
   }
   if (poll.status === 'open' && pastDue) {
     const note = document.createElement('div');

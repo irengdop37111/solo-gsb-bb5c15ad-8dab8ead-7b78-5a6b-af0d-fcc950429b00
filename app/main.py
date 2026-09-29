@@ -25,9 +25,13 @@
   正文；重置演练时清空答复并解除锁定
 - 现场决策投票：主持人创建含 2～4 个选项、指定参与组与截止虚拟秒的投票；
   仅指定组可在截止前提交/改投（每组只计一票）。后台 tick 在状态锁内对
-  到期投票一次性结算：最高票获胜，平票按选项创建顺序决定并持久化；
+  到期投票一次性结算：最高票获胜，平票按选项创建顺序决定；结算当时把
+  各选项票数、逐组选票与获胜项在同一事务固定到 polls/poll_results，此后
+  删组（级联残余选票）、刷新或重启都展示结算当时的一致结果，不用残余票
+  重算；未结算投票删组仍级联资格与选票、实时重算。旧库已结算行启动时从
+  poll_settled 事件恢复固定票数，事件缺失只保留获胜项并标示票数不可恢复。
   暂停冻结截止计时，重连与重启恢复状态。主持人实时查看逐组选票与汇总，
-  参与者结算前只见自己的选择、结算后才看到结果，观察者完全不可见；
+  参与者结算前只见自己的选择、结算后才看到固定结果，观察者完全不可见；
   重置时未结算投票作废，已结算结果按轮次保留
 - 应急车辆申请：主持人为房间创建一个总量固定（1～20 辆）的车辆池；
   各参与组凭加入码提交一份申请（1～5 辆且不超过总量，取消后才能重新申请）。
@@ -192,9 +196,51 @@ def poll_host_view(poll: sqlite3.Row) -> dict:
 
     选票明细（哪一组投了哪个选项）只随主持人快照/事件下发；
     参与者视野走 poll_player_view，观察者完全拿不到投票。
+
+    已结算投票的 tallies/votes 一律取结算当时固定的 poll_results 快照：
+    此后删除参与组虽级联删除 poll_votes 残余行，主持人看到的仍是结算时的
+    结果（获胜项必有固定票数），绝不拿残余选票重算。旧库恢复时若结算事件
+    缺失，则 tallies/votes 为 null 且 tallies_recoverable=false（获胜项仍
+    保留），明确标示票数不可恢复。open/voided 投票仍按当前残余行实时呈现。
     """
     options = pollmod.poll_options(db, poll["id"])
     group_ids = pollmod.poll_group_ids(db, poll["id"])
+    data = {
+        "id": poll["id"],
+        "question": poll["question"],
+        "round": poll["round"],
+        "deadline_ms": poll["deadline_ms"],
+        "status": poll["status"],               # open | settled | voided
+        "group_ids": group_ids,
+        "options": [poll_option_public(o) for o in options],
+        "winner_option_id": poll["winner_option_id"],
+        "settled_at_ms": poll["settled_at_ms"],
+    }
+    if poll["status"] == "settled":
+        fixed = pollmod.fixed_result(db, poll["id"])
+        if fixed is not None and fixed.recoverable:
+            # 以选项列表为序固定汇总（固定快照含全部选项，含 0 票者）
+            fixed_tallies: dict = {}
+            for t in fixed.tallies:
+                if isinstance(t, dict) and "option_id" in t:
+                    fixed_tallies[t["option_id"]] = t.get("count", 0)
+            data["tallies"] = [
+                {"option_id": opt["id"], "count": fixed_tallies.get(opt["id"], 0)}
+                for opt in options
+            ]
+            data["votes"] = [
+                {"group_id": v["group_id"], "option_id": v["option_id"]}
+                for v in fixed.votes
+                if isinstance(v, dict) and "group_id" in v and "option_id" in v
+            ]
+            data["tallies_recoverable"] = True
+        else:
+            # 理论不该发生（新结算同事务必写快照）；旧库结算事件缺失时落入此分支
+            data["tallies"] = None
+            data["votes"] = None
+            data["tallies_recoverable"] = False
+        return data
+    # open：实时逐组选票；voided：重置时选票已删（二者都不存在固定快照）
     votes = []
     tallies = {opt["id"]: 0 for opt in options}
     for row in db.execute(
@@ -204,26 +250,21 @@ def poll_host_view(poll: sqlite3.Row) -> dict:
         votes.append({"group_id": row["group_id"], "option_id": row["option_id"]})
         if row["option_id"] in tallies:
             tallies[row["option_id"]] += 1
-    return {
-        "id": poll["id"],
-        "question": poll["question"],
-        "round": poll["round"],
-        "deadline_ms": poll["deadline_ms"],
-        "status": poll["status"],               # open | settled | voided
-        "group_ids": group_ids,
-        "options": [poll_option_public(o) for o in options],
-        "votes": votes,                         # 逐组选票：[{group_id, option_id}]
-        "tallies": [
-            {"option_id": opt["id"], "count": tallies[opt["id"]]} for opt in options
-        ],
-        "winner_option_id": poll["winner_option_id"],
-        "settled_at_ms": poll["settled_at_ms"],
-    }
+    data["votes"] = votes
+    data["tallies"] = [
+        {"option_id": opt["id"], "count": tallies[opt["id"]]} for opt in options
+    ]
+    return data
 
 
 def poll_player_view(poll: sqlite3.Row, group_id: int) -> dict:
     """参与者视野：结算前只见自己的选择（无任何票数/他组信息），
-    结算后才看到获胜选项与选项汇总；作废投票只见作废状态。"""
+    结算后才看到获胜选项与选项汇总；作废投票只见作废状态。
+
+    已结算投票的票数同样取固定快照，与主持人看到的票数严格一致；固定快照
+    不可恢复（旧库缺结算事件）时 tallies 为 null 且 tallies_recoverable=false，
+    不使用残余选票伪造。本组已投选项结算后也以固定快照为准（删组不影响仍有
+    资格的他组；本组若被删则白名单已不再包含本组，不会进入本视图）。"""
     options = pollmod.poll_options(db, poll["id"])
     data = {
         "id": poll["id"],
@@ -234,20 +275,34 @@ def poll_player_view(poll: sqlite3.Row, group_id: int) -> dict:
         "options": [poll_option_public(o) for o in options],
         "my_option_id": None,
     }
-    vote = pollmod.vote_of_group(db, poll["id"], group_id)
-    data["my_option_id"] = vote["option_id"] if vote is not None else None
     if poll["status"] == "settled":
-        # 结算后结果公开给参与组：获胜选项 + 汇总票数（仍不下发逐组选票明细）
-        tallies = {opt["id"]: 0 for opt in options}
-        for row in db.execute(
-            "SELECT option_id, COUNT(*) AS c FROM poll_votes WHERE poll_id = ? GROUP BY option_id",
-            (poll["id"],),
-        ):
-            if row["option_id"] in tallies:
-                tallies[row["option_id"]] = row["c"]
+        fixed = pollmod.fixed_result(db, poll["id"])
+        my_option_id = None
+        if fixed is not None and fixed.recoverable:
+            my_option_id = next(
+                (v.get("option_id") for v in fixed.votes
+                 if isinstance(v, dict) and v.get("group_id") == group_id),
+                None,
+            )
+            fixed_tallies: dict = {}
+            for t in fixed.tallies:
+                if isinstance(t, dict) and "option_id" in t:
+                    fixed_tallies[t["option_id"]] = t.get("count", 0)
+            data["tallies"] = [
+                {"option_id": opt["id"], "count": fixed_tallies.get(opt["id"], 0)}
+                for opt in options
+            ]
+            data["tallies_recoverable"] = True
+        else:
+            # 快照不可恢复：本组选择同样不可信（残余票可能已被删），不回填
+            data["tallies"] = None
+            data["tallies_recoverable"] = False
+        data["my_option_id"] = my_option_id
         data["winner_option_id"] = poll["winner_option_id"]
         data["settled_at_ms"] = poll["settled_at_ms"]
-        data["tallies"] = [{"option_id": oid, "count": n} for oid, n in tallies.items()]
+        return data
+    vote = pollmod.vote_of_group(db, poll["id"], group_id)
+    data["my_option_id"] = vote["option_id"] if vote is not None else None
     return data
 
 

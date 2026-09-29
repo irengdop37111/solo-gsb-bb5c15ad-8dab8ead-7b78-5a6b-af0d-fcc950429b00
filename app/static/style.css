@@ -421,6 +421,7 @@ button:disabled { opacity: .35; cursor: not-allowed; }
   gap: 8px;
 }
 .poll-option-row.poll-winner { color: var(--green); font-weight: 700; }
+.poll-counts-missing { color: var(--amber); font-family: inherit; }
 .poll-vote-btn {
   background: transparent;
   border: 1px solid var(--border);

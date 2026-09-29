@@ -6,8 +6,10 @@
 - 创建投票（2～4 个选项 + 指定参与组白名单 + 截止虚拟毫秒，归属当前轮次）
 - 组投票 / 改投（UNIQUE(poll_id, group_id) 保证每组只计一票，改投原地更新）
 - tick 结算：对「当前轮次、open、deadline_ms <= 虚拟时钟」的投票一次性
-  结算——最高票获胜，平票按选项创建顺序（seq 最小）决定，结果写回 polls 行；
-  结算只数本轮票，且每条投票只结算一次（status open → settled）
+  结算——最高票获胜，平票按选项创建顺序（seq 最小）决定，结果与各选项
+  票数、逐组选票在同一事务固定到 polls / poll_results；结算只数本轮票，
+  且每条投票只结算一次（status open → settled），之后删组级联选票也不
+  改已结算结果（读取一律以固定快照为准，不用残余选票重算）
 - 重置：未结算（open）投票作废（status → voided、票删除），已结算结果
   按轮次保留不动
 
@@ -18,6 +20,7 @@ main.room_elapsed_ms（暂停取冻结值）作为当前虚拟毫秒；重启时
 
 from __future__ import annotations
 
+import json
 import sqlite3
 import time
 from dataclasses import dataclass
@@ -140,6 +143,7 @@ class SettleResult:
     poll: sqlite3.Row
     winner: sqlite3.Row
     tallies: dict[int, int]   # option_id -> 票数（未得票选项为 0）
+    votes: list[dict]         # 结算当时逐组选票 [{group_id, option_id}]
 
 
 def settle_due_polls(
@@ -153,6 +157,10 @@ def settle_due_polls(
     每条投票只可能被结算一次：先按 status='open' 取出、写回 settled 并
     commit，后续 tick（以及重启后）不会再次结算。最高票获胜；平票按
     选项创建顺序（seq 最小）决定——全员零票时选项 0 获胜，确定性、可复现。
+
+    结算当时把 **tallies（各选项票数）与逐组 votes 固定** 到 poll_results。
+    此后参与组被删除只会级联删除 poll_votes 残余行，已结算结果一律以固定
+    快照为准（刷新、重启、删组都不变），不会出现「获胜项 0 票」的矛盾。
     """
     due = conn.execute(
         """SELECT * FROM polls
@@ -166,23 +174,38 @@ def settle_due_polls(
             "SELECT * FROM poll_options WHERE poll_id = ? ORDER BY seq", (poll["id"],)
         ).fetchall()
         tallies = {opt["id"]: 0 for opt in options}
+        votes: list[dict] = []
         for row in conn.execute(
-            "SELECT option_id, COUNT(*) AS c FROM poll_votes"
-            " WHERE poll_id = ? AND round = ? GROUP BY option_id",
+            "SELECT group_id, option_id FROM poll_votes"
+            " WHERE poll_id = ? AND round = ? ORDER BY group_id",
             (poll["id"], round_idx),
         ):
+            votes.append({"group_id": row["group_id"], "option_id": row["option_id"]})
             if row["option_id"] in tallies:  # 防御：孤立 option_id 不计入
-                tallies[row["option_id"]] = row["c"]
+                tallies[row["option_id"]] += 1
         # max 在票数相等时保留先遇到者；options 已按 seq 升序 → 平票取创建最早选项
         winner = max(options, key=lambda opt: (tallies[opt["id"]], -opt["seq"]))
+        # polls 状态与固定票数快照在同一事务落库：要么一起固定，要么不结算，
+        # 不存在「已 settled 却没有固定票数」而被迫用残余选票重算的中间态。
         conn.execute(
             "UPDATE polls SET status = 'settled', winner_option_id = ?, settled_at_ms = ?"
             " WHERE id = ? AND status = 'open'",
-            (winner["id"], elapsed_ms, poll["id"]),
+            (winner["id"], elapsed_ms, poll["id"],),
+        )
+        conn.execute(
+            "INSERT INTO poll_results"
+            " (poll_id, tallies_json, votes_json, recoverable, recovered_from_event, created_at)"
+            " VALUES (?, ?, ?, 1, NULL, ?)",
+            (poll["id"],
+             json.dumps([{"option_id": oid, "count": n}
+                         for oid, n in tallies.items()], ensure_ascii=False),
+             json.dumps(votes, ensure_ascii=False),
+             time.time()),
         )
         conn.commit()
         fresh = conn.execute("SELECT * FROM polls WHERE id = ?", (poll["id"],)).fetchone()
-        results.append(SettleResult(poll=fresh, winner=winner, tallies=tallies))
+        results.append(SettleResult(poll=fresh, winner=winner,
+                                    tallies=tallies, votes=votes))
     return results
 
 
@@ -215,3 +238,36 @@ def vote_of_group(conn: sqlite3.Connection, poll_id: int, group_id: int) -> sqli
         "SELECT * FROM poll_votes WHERE poll_id = ? AND group_id = ?",
         (poll_id, group_id),
     ).fetchone()
+
+
+@dataclass
+class FixedResult:
+    """结算当时固定的结果快照（poll_results 行的解析视图）。"""
+    tallies: list[dict]   # [{"option_id","count"}]，按固定时口径（含未得票的 0）
+    votes: list[dict]     # [{"group_id","option_id"}]
+    recoverable: bool
+    recovered_from_event: int | None
+
+
+def fixed_result(conn: sqlite3.Connection, poll_id: int) -> FixedResult | None:
+    """已结算投票的固定票数快照；无行（理论上不该出现）返回 None。
+
+    旧库恢复：recoverable=False 表示对应 poll_settled 事件缺失，只保留了
+    获胜项，调用方必须明确标示票数不可恢复，不得回退到残余选票重算。
+    """
+    row = conn.execute(
+        "SELECT * FROM poll_results WHERE poll_id = ?", (poll_id,)
+    ).fetchone()
+    if row is None:
+        return None
+    try:
+        tallies = json.loads(row["tallies_json"])
+        votes = json.loads(row["votes_json"])
+    except (ValueError, TypeError):
+        tallies, votes = [], []
+    return FixedResult(
+        tallies=tallies if isinstance(tallies, list) else [],
+        votes=votes if isinstance(votes, list) else [],
+        recoverable=bool(row["recoverable"]),
+        recovered_from_event=row["recovered_from_event"],
+    )

@@ -40,14 +40,23 @@ WebSocket 恢复；参与者只能看到本组答复，**看不到他组正文**
 能在**截止前**投票或改投，**每组只计一票**（同组任一人操作即全组生效，重复投票
 原地更新，不增加票数）。后台 tick 与卡片揭示共用同一把 `state_lock`，在锁内对到期
 投票**一次性结算**：**最高票获胜，平票按选项创建顺序**决定（全员零票时第一个选项
-获胜），获胜选项与结算虚拟毫秒持久化到 SQLite。截止计时走虚拟时钟——**暂停即冻结**，
-暂停期间仍可改投；重连、刷新与服务重启后状态恢复（重启先把运行中房间安全冻结为
-已暂停），每条投票只结算一次，不会重复广播。主持人在投票卡片上**实时查看逐组选票**
-（哪一组投了哪个选项、未投组名单）与选项汇总；参与者在**结算前只见自己的选择**，
-看不到任何票数或他组选择，**结算后**才看到获胜选项与汇总票数（仍看不到逐组明细）；
-观察者对投票**完全不可见**（快照不带、`poll_*` 事件不下发）。**重置时未结算投票
-一律作废**（选票删除、状态置为已作废），**已结算结果按轮次保留**（归属创建轮次，
-主持人可回看历史轮结果，新参与者视图不再出现旧轮投票）。
+获胜）。**结算当时即把各选项票数、逐组选票与获胜项固定到 SQLite**（`polls` 状态与
+`poll_results` 快照同一事务落库）：此后删除投过票的参与组虽会级联删除其选票，
+已结算结果也一律按固定快照展示，**刷新、断线重连、服务重启都不变**，不会出现
+「获胜项 0 票、另一选项 1 票」的矛盾；**未结算投票**删除参与组仍按旧规则级联该组
+资格与选票，剩余票数实时重算，截止前改投、最高票获胜与平票按选项顺序决胜的规则
+不变。截止计时走虚拟时钟——**暂停即冻结**，暂停期间仍可改投；重连、刷新与服务
+重启后状态恢复（重启先把运行中房间安全冻结为已暂停），每条投票只结算一次，不会
+重复广播。主持人在投票卡片上：投票中**实时查看逐组选票**（哪一组投了哪个选项、
+未投组名单）与选项汇总，已结算则查看**结算当时固定**的逐组选票与汇总；参与者在
+**结算前只见自己的选择**，看不到任何票数或他组选择，**结算后**才看到获胜选项与
+固定汇总票数（仍看不到逐组明细），且与主持人所见票数严格一致；观察者对投票
+**完全不可见**（快照不带、`poll_*` 事件不下发）。**重置时未结算投票一律作废**
+（选票删除、状态置为已作废），**已结算结果按轮次保留**（归属创建轮次，主持人可
+回看历史轮结果，新参与者视图不再出现旧轮投票）。**旧库升级**时已结算记录自动从
+对应的 `poll_settled` 事件恢复固定票数；若该事件已缺失，则保留获胜选项并把
+`tallies_recoverable` 置为 `false`、票数字段返回 `null`，界面标示「票数不可恢复」，
+**绝不按残余选票重算伪造**。
 
 **应急车辆申请**：主持人可为房间创建一个**总量固定（1～20 辆）**的车辆池（每房间
 一个，创建后不可改）。各参与组凭**组加入码**提交**一份**车辆申请（**1～5 辆**且
@@ -121,7 +130,8 @@ docker compose up --build
 - **端口：** `8000`（宿主机端口可在 `docker-compose.yml` 的 `ports` 中修改）
 
 依赖安装、SQLite 建表与**旧库就地迁移**（补回执门槛、处置答复、复盘锚点、现场决策
-投票、应急车辆申请、现场情报核验板等新列/新表）均已纳入启动流程，无需额外初始化步骤；
+投票、应急车辆申请、现场情报核验板等新列/新表，并为旧库已结算投票从结算事件恢复
+固定票数）均已纳入启动流程，无需额外初始化步骤；
 数据持久化在命名卷 `inject-data` 中。
 
 ## 配置（环境变量，可在 docker-compose.yml 的 `environment` 中调整）
@@ -171,9 +181,13 @@ docker compose up --build
    只计一票，同组任一人操作全组生效）；**结算前只能看到本组的选择**，暂停期间截止
    计时冻结、仍可改投。到虚拟截止点后服务端在状态锁内一次性自动结算（最高票获胜，
    平票按选项顺序），主持人卡片实时显示逐组选票与汇总，参与者**结算后**才看到获胜
-   选项与票数；观察者看不到任何投票。主持人发起时若截止点不晚于当前虚拟时钟会被
+   选项与票数；观察者看不到任何投票。**结算当时各选项票数与获胜项即被固定**：结算
+   后再删除投过票的参与组（级联其选票）、刷新或重启，主持人与仍有资格参与组看到的
+   都是结算当时的一致结果，不会出现获胜项零票；未结算投票删组仍随删该组资格与选票。
+   主持人发起时若截止点不晚于当前虚拟时钟会被
    拒绝（`400`）；重置时未结算投票作废，已结算结果按轮次保留并在主持人列表标记
-   所属历史轮。
+   所属历史轮。旧库已结算投票在启动时从结算事件恢复票数，事件缺失则保留获胜项并
+   标示「票数不可恢复」。
 8. **应急车辆申请（任意时刻）**：控制台「应急车辆申请」填写总量（1～20 辆）→
    「创建车辆池」（每房间一个，创建后固定）。参与组在页面下方「应急车辆申请」面板
    填写数量（1～5 辆且不超总量）→「提交车辆申请」：服务端按受理顺序处理——无更早
@@ -326,14 +340,38 @@ DATABASE_PATH=./data/inject.db uvicorn app.main:app --reload --port 8000
 | `POST` | `/api/rooms/{房间码}/polls` | 主持人发起投票：`{question, options[2~4], group_ids[≥1], deadline_seconds[1~86400]}`；`201` 返回主持人全量投票对象。选项空/重复、组不属于本房间返回 `400/404`；截止虚拟秒不晚于当前虚拟时钟返回 `400` |
 | `PUT` | `/api/join/{组加入码}/polls/{poll_id}/vote` | 指定组投票/改投：`{option_id}`；每组只计一票（改投原地更新，返回 `changed`）。非白名单组、旧轮次投票 `404`；已结算/已作废 `409`；已到截止点（等待 tick 结算的窄窗口）`409`；选项不属于本投票 `404` |
 
-- **快照（主持人）**：`polls` 数组含**全部轮次**投票，每条为
+- **快照（主持人）**：`polls` 数组含**全部轮次**投票。`open/voided` 每条为
   `{id, question, round, deadline_ms, status, group_ids, options:[{id,seq,text}],
   votes:[{group_id,option_id}], tallies:[{option_id,count}], winner_option_id,
-  settled_at_ms}`；`status ∈ open | settled | voided`。
+  settled_at_ms}`；`status ∈ open | settled | voided`。**`settled` 的
+  `tallies/votes` 是结算当时固定快照**（删除参与组级联残余选票后也不变），
+  另带布尔字段 `tallies_recoverable`：`true` 为固定票数可读；旧库缺结算事件时
+  为 `false`，此时 `tallies` 与 `votes` 为 `null`（获胜项 `winner_option_id`
+  仍保留），明确标示票数不可恢复，不按残余选票重算。
 - **快照（参与者）**：只含**当前轮次、白名单包含本组**的投票。`open` 时为
   `{id, question, round, deadline_ms, status, options, my_option_id}`——
   不含票数、获胜者与他组选择；`settled` 时额外带 `winner_option_id /
-  settled_at_ms / tallies`（结果公开，但仍无逐组 `votes`）。
+  settled_at_ms / tallies / tallies_recoverable`（结果公开，但仍无逐组 `votes`）。
+  已结算 `tallies` 与主持人读同一固定快照，两端口票数严格一致；
+  `tallies_recoverable=false` 时 `tallies` 为 `null`。
+- **结果读取的一致性（本轮修复）**：主持人用房间码读 `GET /api/rooms/{房间码}`、
+  仍有资格的参与组用组加入码读 `GET /api/join/{组加入码}`（WebSocket 重连快照
+  同源），已结算投票的获胜项与各选项票数都取自 `poll_results` 固定快照：
+  结算后再删除投过票的参与组、刷新页面或重启服务，两端口始终展示**结算当时的
+  结果**且彼此一致。调用示例：
+
+  ```bash
+  # 主持人（房间码 = 凭证，全量视野；已结算投票含固定 tallies/votes）
+  curl -s http://localhost:8000/api/rooms/$ROOM_CODE \
+    | python3 -c 'import sys,json; d=json.load(sys.stdin); print(json.dumps(d["polls"], ensure_ascii=False, indent=2))'
+
+  # 参与组（6 位组加入码 = 凭证；只含本轮本组投票，已结算含同一固定 tallies）
+  curl -s http://localhost:8000/api/join/$JOIN_CODE \
+    | python3 -c 'import sys,json; d=json.load(sys.stdin); print(json.dumps(d["polls"], ensure_ascii=False, indent=2))'
+  ```
+
+  两条命令对同一条已结算投票输出的 `winner_option_id` 与 `tallies` 必然相同；
+  旧库结算事件缺失时两端口都是 `tallies_recoverable: false`、`tallies: null`。
 - **观察者快照与任何 `poll_*` 事件均不下发**（投票对观察者完全不可见）。
 - **事件**：
   - `poll_created`：主持人收全量投票对象；白名单参与组收**脱敏 open 载荷**
@@ -341,23 +379,35 @@ DATABASE_PATH=./data/inject.db uvicorn app.main:app --reload --port 8000
   - `poll_vote_updated`：`{poll_id, group_id, option_id}`；主持人额外收
     `poll` 全量对象（逐组选票），**只有投票的本组**参与者收脱敏三字段，
     同白名单的他组与观察者收不到。
-  - `poll_settled`：tick 在 `state_lock` 内一次性结算后广播。主持人收全量
-    （含 `winner_option_id / tallies / votes / settled_at_ms`）；白名单参与组
-    由服务端按组定向投递脱敏结果载荷（本组已投选项 + 获胜结果与汇总，无逐组
-    明细）；观察者收不到。断线重连以快照为准，不会因错过事件而看不到结果。
+  - `poll_settled`：tick 在 `state_lock` 内一次性结算后广播，落库的主持人
+    全量载荷（`winner_option_id / tallies / votes / settled_at_ms`）即为
+    结算当时固定值，也是旧库恢复票数的数据源；白名单参与组由服务端按组定向
+    投递脱敏结果载荷（本组已投选项 + 获胜结果与固定汇总，无逐组明细）；
+    观察者收不到。断线重连以快照为准，不会因错过事件而看不到结果。
   - `poll_voided`：重置作废未结算投票时逐条广播，**仅主持人可见**
     （`{id, round, status:'voided'}`）；参与者在 `reset` 事件时清空本轮投票。
-- **结算口径**：`polls.status` 由 tick 从 `open` 原子置为 `settled` 并写回
-  `winner_option_id / settled_at_ms`，每条投票只结算一次（重复 tick、服务重启
-  均不重复结算）；票数只统计**本轮** `poll_votes`，最高票获胜，平票按
-  `poll_options.seq`（创建顺序）取最早者，全员零票取第一个选项。
-- **持久化与轮次**：投票存于 `polls / poll_options / poll_groups / poll_votes`
-  四表（`UNIQUE(poll_id, group_id)` 保证每组一票），均随 SQLite 持久化；
-  截止是相对本轮开始的**虚拟毫秒**，暂停冻结、重启先冻结 running 房间。
-  重置删除未结算投票的选票并置 `voided`，已结算行与其选票按 `round` 保留；
-  删除参与组/房间经外键级联清理白名单、选票与投票。
-- 旧库启动时自动迁移：投票四表为全新表，由 `CREATE TABLE IF NOT EXISTS`
-  直接补齐（含 `idx_polls_room` 等索引），既有演练视为没有任何投票。
+- **结算口径**：tick 在同一事务把 `polls.status` 从 `open` 原子置为 `settled`、
+  写回 `winner_option_id / settled_at_ms`，并向 `poll_results` 写入固定的
+  `tallies_json / votes_json`；每条投票只结算一次（重复 tick、服务重启均不
+  重复结算，也不重新计票）。结算票数只统计**本轮** `poll_votes`，最高票获胜，
+  平票按 `poll_options.seq`（创建顺序）取最早者，全员零票取第一个选项。
+  结算后 `poll_votes` 残余行仅作历史原始数据，**读取一律以固定快照为准**。
+  未结算投票不产生固定快照，删除参与组仍级联该组白名单资格与选票、剩余票数
+  实时重算（与既有规则一致）。
+- **持久化与轮次**：投票存于 `polls / poll_options / poll_groups / poll_votes /
+  poll_results` 五表（`UNIQUE(poll_id, group_id)` 保证每组一票；
+  `poll_results.poll_id` 一对一、随投票/房间外键级联删除），均随 SQLite
+  持久化；截止是相对本轮开始的**虚拟毫秒**，暂停冻结、重启先冻结 running 房间。
+  重置删除未结算投票的选票并置 `voided`（不写 `poll_results`），已结算行、其
+  固定快照与残余选票按 `round` 保留；删除参与组级联清理其在各表的白名单/选票，
+  **但不改已结算投票的固定快照**。
+- 旧库启动时自动迁移：投票五表为全新表，由 `CREATE TABLE IF NOT EXISTS`
+  直接补齐（含 `idx_polls_room` 等索引），既有演练视为没有任何投票；对升级前
+  已经 `settled` 但缺少 `poll_results` 行的投票，启动时按
+  `poll_settled` 事件（`json_extract(payload,'$.id')` 对应投票 id）恢复固定
+  票数并回填 `recovered_from_event`；**事件缺失则只保留获胜项，写入
+  `recoverable=0` 的空快照**（读取侧标示票数不可恢复），绝不拿残余选票重算。
+  恢复在每次启动时幂等执行（已有 `poll_results` 行的投票跳过）。
 - 投票事件**不进入复盘包导出**（与观察分享事件同类，整类不在导出白名单）。
 
 ## 应急车辆申请 API 与事件

@@ -141,6 +141,15 @@ CREATE TABLE IF NOT EXISTS poll_votes (
     UNIQUE (poll_id, group_id)                       -- 每组只计一票，改投即原地更新
 );
 
+CREATE TABLE IF NOT EXISTS poll_results (
+    poll_id     INTEGER PRIMARY KEY REFERENCES polls(id) ON DELETE CASCADE,
+    tallies_json TEXT NOT NULL,                        -- 结算当时各选项固定票数 [{"option_id","count"}]
+    votes_json   TEXT NOT NULL,                        -- 结算当时逐组选票快照 [{"group_id","option_id"}]
+    recoverable INTEGER NOT NULL DEFAULT 1,            -- 0 = 旧库缺结算事件，票数不可恢复（仅保留获胜项）
+    recovered_from_event INTEGER,                      -- 恢复票数所用的 poll_settled 事件 id（旧库恢复时回填）
+    created_at  REAL NOT NULL
+);
+
 -- 应急车辆申请：每房间一个总量固定的车辆池（重置不清池）；
 -- 每组同时仅一份申请，按受理顺序（queue_seq）立即分配或入队，取消后从队首补位。
 CREATE TABLE IF NOT EXISTS vehicle_pools (
@@ -227,7 +236,10 @@ def _migrate(conn: sqlite3.Connection) -> None:
     poll_votes 均为全新表（answers / observer_shares 同款），由
     SCHEMA 中的 CREATE TABLE IF NOT EXISTS 直接在旧库补齐，无需额外迁移；
     旧库既有演练视为没有任何锚点与投票。重置不删锚点与已结算投票，
-    升级后仍按所属轮次保留。
+    升级后仍按所属轮次保留。poll_results（结算固定票数）同为全新表；
+    旧库升级前已 settled 的投票没有该表行，由 init_schema 末尾的
+    _recover_settled_poll_results 从 poll_settled 事件恢复（事件缺失则
+    标记票数不可恢复），不在本函数内处理。
     应急车辆申请表 vehicle_pools / vehicle_requests 同为全新表，随 SCHEMA
     在旧库直接补齐；旧库演练视为尚未创建车辆池、没有任何申请。
     现场情报核验板表 intel_claims / intel_claim_groups / intel_reports
@@ -268,6 +280,79 @@ def connect() -> sqlite3.Connection:
     return conn
 
 
+def _recover_settled_poll_results(conn: sqlite3.Connection) -> None:
+    """旧库恢复：为缺少 poll_results 快照的已结算投票补固定票数。
+
+    新版本在结算当时把各选项票数、逐组选票与获胜项固定到 poll_results；
+    旧版本只写了 polls.winner_option_id / settled_at_ms，票数由残余选票
+    现场重算——参与组被级联删除后残余选票会伪造出「获胜项 0 票」的矛盾。
+
+    恢复口径：
+    - 找到对应 poll_settled 事件（落库的是结算当时主持人全量载荷，含
+      tallies / votes）→ 以事件内票数恢复，recoverable=1 并回填事件 id；
+    - 事件缺失（例如被外部裁剪）→ 绝不拿残余选票重算，只保留 polls 行内
+      获胜项并落 recoverable=0（tallies/votes 为空数组），由读取侧明确
+      标示「票数不可恢复」。
+    每条已结算投票至多一行 poll_results；重复执行初始化时这些行已存在，
+    自然跳过（幂等）。
+    """
+    missing = conn.execute(
+        """SELECT p.id AS poll_id, e2.id AS event_id, e2.payload AS payload
+           FROM polls p
+           LEFT JOIN (
+               -- 每条投票至多取一条最早的结算事件（正常只结算一次、只一条；
+               -- 即便事件被外部重复写入也确定性取最早者，绝不产生重复恢复行）
+               SELECT e.room_id AS room_id,
+                      json_extract(e.payload, '$.id') AS poll_id,
+                      MIN(e.id) AS event_id
+               FROM events e
+               WHERE e.type = 'poll_settled'
+               GROUP BY e.room_id, json_extract(e.payload, '$.id')
+           ) ev ON ev.room_id = p.room_id AND ev.poll_id = p.id
+           LEFT JOIN events e2 ON e2.id = ev.event_id
+           WHERE p.status = 'settled'
+             AND NOT EXISTS (SELECT 1 FROM poll_results r WHERE r.poll_id = p.id)
+           ORDER BY p.id"""
+    ).fetchall()
+    now = time.time()
+    for row in missing:
+        tallies: list = []
+        votes: list = []
+        recoverable = 0
+        event_id = None
+        if row["event_id"] is not None:
+            try:
+                payload = json.loads(row["payload"])
+                t = payload.get("tallies")
+                v = payload.get("votes")
+                # 仅当载荷结构与正式 poll_settled 主持人载荷一致时才采信；
+                # 任何元素缺键/类型不对都视为事件不可用，宁可不恢复也不伪造。
+                tallies_ok = (
+                    isinstance(t, list)
+                    and all(isinstance(x, dict) and isinstance(x.get("option_id"), int)
+                            and isinstance(x.get("count"), int) for x in t)
+                )
+                votes_ok = (
+                    isinstance(v, list)
+                    and all(isinstance(x, dict) and isinstance(x.get("group_id"), int)
+                            and isinstance(x.get("option_id"), int) for x in v)
+                )
+                if tallies_ok and votes_ok:
+                    tallies, votes = t, v
+                    recoverable = 1
+                    event_id = row["event_id"]
+            except (ValueError, TypeError, AttributeError):
+                recoverable = 0  # 载荷损坏视同事件不可用
+        conn.execute(
+            "INSERT INTO poll_results"
+            " (poll_id, tallies_json, votes_json, recoverable, recovered_from_event, created_at)"
+            " VALUES (?, ?, ?, ?, ?, ?)",
+            (row["poll_id"], json.dumps(tallies, ensure_ascii=False),
+             json.dumps(votes, ensure_ascii=False), recoverable, event_id, now),
+        )
+    conn.commit()
+
+
 def init_schema(conn: sqlite3.Connection) -> None:
     """建表，并把进程停止时仍处于 running 的房间安全冻结为 paused。
 
@@ -289,6 +374,9 @@ def init_schema(conn: sqlite3.Connection) -> None:
     """
     _migrate(conn)
     conn.executescript(SCHEMA)
+    # 旧库已结算投票从对应 poll_settled 事件恢复固定票数；事件缺失则只保留
+    # 获胜项并标记票数不可恢复，绝不用残余选票重算。全新库没有已结算投票，为空操作。
+    _recover_settled_poll_results(conn)
     now = time.time()
     rows = conn.execute("SELECT * FROM rooms WHERE status = 'running'").fetchall()
     for row in rows:

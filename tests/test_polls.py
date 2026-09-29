@@ -14,7 +14,16 @@ state_lock 临界区内对投票的操作次序，校验：
 5. 轮次隔离：只有当前轮次的 open 投票参与结算，旧轮次遗留行不动；
 6. 级联：删除参与组/房间时投票关联表随之清理；
 7. 旧库迁移：全新 SCHEMA 含全部投票表与索引。
+
+本轮（结算固定票数）补充：
+8. 结算当时固定 tallies/逐组 votes 到 poll_results；结算后删除投过票的参与组
+   级联清掉残余选票，固定票数与获胜项不变（覆盖「获胜项残余 0 票、另一项 1 票」
+   的旧矛盾场景）；重启换连接读到的仍是结算当时结果；
+9. 旧库恢复：已结算行无 poll_results 时从对应 poll_settled 事件恢复票数；
+   事件缺失只保留获胜项并标记 recoverable=0（空 tallies/votes），绝不拿残余
+   选票重算；恢复幂等；删除房间级联清理 poll_results。
 """
+import json
 import os
 import sqlite3
 import sys
@@ -370,6 +379,225 @@ def test_legacy_schema_includes_poll_tables():
     print("ok: schema creates poll tables/indexes and UNIQUE(poll, group)")
 
 
+def test_settled_tallies_fixed_survive_group_delete():
+    """结算固定：A、B 各一票平票 → 按选项顺序 A 获胜；结算后删除投 A 的组，
+    poll_votes 被级联成「A 零票、B 一票」的残余状态。固定快照必须仍是结算当时
+    A=1、B=1 且获胜项 A（旧实现按残余票重算会显示获胜项 0 票、B 1 票的矛盾）。"""
+    with tempfile.TemporaryDirectory() as d:
+        conn = open_db(os.path.join(d, "t.db"))
+        rid, _ = make_room(conn)
+        ga = add_group(conn, rid, "红队", "RRR101")
+        gb = add_group(conn, rid, "蓝队", "BBB102")
+        poll = make_poll(conn, rid, ["A", "B"], [ga, gb], 10_000)
+        oa, ob = pm.poll_options(conn, poll["id"])
+        pm.cast_vote(conn, poll, ga, oa["id"])  # 红队投 A（最终获胜项）
+        pm.cast_vote(conn, poll, gb, ob["id"])  # 蓝队投 B
+        res = pm.settle_due_polls(conn, rid, 0, 10_000)
+        assert len(res) == 1 and res[0].winner["id"] == oa["id"]  # 平票按 seq → A
+        assert res[0].tallies == {oa["id"]: 1, ob["id"]: 1}
+
+        # 删除投了获胜项 A 的红队：选票随组级联删除（残余只剩 B 一票）
+        conn.execute("DELETE FROM groups WHERE id=?", (ga,))
+        conn.commit()
+        residual = conn.execute(
+            "SELECT option_id, COUNT(*) c FROM poll_votes WHERE poll_id=? GROUP BY option_id",
+            (poll["id"],)).fetchall()
+        assert [(r["option_id"], r["c"]) for r in residual] == [(ob["id"], 1)]
+
+        # 固定快照不随残余票变化：A 仍 1 票（获胜项）、B 仍 1 票
+        fixed = pm.fixed_result(conn, poll["id"])
+        assert fixed is not None and fixed.recoverable is True
+        fixed_tallies = {t["option_id"]: t["count"] for t in fixed.tallies}
+        assert fixed_tallies == {oa["id"]: 1, ob["id"]: 1}
+        assert {(v["group_id"], v["option_id"]) for v in fixed.votes} == {
+            (ga, oa["id"]), (gb, ob["id"])}
+        row = conn.execute("SELECT * FROM polls WHERE id=?", (poll["id"],)).fetchone()
+        assert row["status"] == "settled" and row["winner_option_id"] == oa["id"]
+
+        # 再结算任何投票都不影响已固定行；未结算投票仍按残余选票实时统计
+        assert pm.settle_due_polls(conn, rid, 0, 999_999) == []
+        conn.close()
+    print("ok: settled tallies fixed at settlement; group delete cannot rewrite result")
+
+
+def test_fixed_result_survives_restart_reconnect():
+    """删组后重启（重新连接 + init_schema）：已结算结果仍读固定快照，与删组后、
+    重启前完全一致；刷新（重新读视图，见 test_poll_views）同理。"""
+    with tempfile.TemporaryDirectory() as d:
+        path = os.path.join(d, "t.db")
+        conn = open_db(path)
+        rid, _ = make_room(conn)
+        g1 = add_group(conn, rid, "红队", "RRR111")
+        g2 = add_group(conn, rid, "蓝队", "BBB112")
+        poll = make_poll(conn, rid, ["A", "B"], [g1, g2], 10_000)
+        oa, ob = pm.poll_options(conn, poll["id"])
+        pm.cast_vote(conn, poll, g1, ob["id"])  # B 一票获胜
+        pm.cast_vote(conn, poll, g2, ob["id"])
+        pm.settle_due_polls(conn, rid, 0, 10_000)
+        conn.execute("DELETE FROM groups WHERE id=?", (g1,))  # 删掉一张投 B 的票
+        conn.commit()
+        conn.close()
+
+        conn2 = sqlite3.connect(path)
+        conn2.row_factory = sqlite3.Row
+        conn2.execute("PRAGMA foreign_keys=ON")
+        dbmod.init_schema(conn2)  # 模拟重启：迁移/恢复（已固定行不应被改动）
+        fixed = pm.fixed_result(conn2, poll["id"])
+        fixed_tallies = {t["option_id"]: t["count"] for t in fixed.tallies}
+        assert fixed.recoverable is True
+        assert fixed_tallies == {oa["id"]: 0, ob["id"]: 2}
+        assert len(fixed.votes) == 2
+        row = conn2.execute("SELECT winner_option_id FROM polls WHERE id=?",
+                            (poll["id"],)).fetchone()
+        assert row["winner_option_id"] == ob["id"]
+        conn2.close()
+    print("ok: fixed settlement result survives restart after group deletion")
+
+
+def _settled_row_legacy(conn, rid, options=("A", "B"), votes=()):
+    """构造旧版本已结算投票：只写 polls/poll_options/poll_votes，不写 poll_results，
+    模拟旧库升级瞬间的状态（winner 已固定、票数只散落在残余选票里）。"""
+    gids = []
+    poll = pm.create_poll(conn, rid, "旧投票", list(options), [], 10_000, 0)
+    opts = pm.poll_options(conn, poll["id"])
+    for i, (gname, gcode, opt_idx) in enumerate(votes):
+        gid = conn.execute(
+            "INSERT INTO groups (room_id,name,join_code,created_at) VALUES (?,?,?,?)",
+            (rid, gname, gcode, time.time())).lastrowid
+        conn.execute(
+            "INSERT INTO poll_groups (poll_id,group_id) VALUES (?,?)", (poll["id"], gid))
+        conn.execute(
+            "INSERT INTO poll_votes (room_id,poll_id,group_id,option_id,round,updated_at)"
+            " VALUES (?,?,?,?,0,?)",
+            (rid, poll["id"], gid, opts[opt_idx]["id"], time.time()))
+        gids.append(gid)
+    conn.execute(
+        "UPDATE polls SET status='settled', winner_option_id=?, settled_at_ms=10000"
+        " WHERE id=?", (opts[0]["id"], poll["id"]))  # 旧版固定的获胜项 = 选项 A
+    conn.commit()
+    return poll, opts, gids
+
+
+def _add_poll_settled_event(conn, rid, poll, opts, tallies, votes):
+    cur = conn.execute(
+        "INSERT INTO events (room_id,type,payload,created_at) VALUES (?,?,?,?)",
+        (rid, "poll_settled",
+         json.dumps({"id": poll["id"], "status": "settled",
+                     "tallies": [{"option_id": oid, "count": n} for oid, n in tallies],
+                     "votes": [{"group_id": gid, "option_id": oid} for gid, oid in votes]},
+                    ensure_ascii=False),
+         time.time()))
+    conn.commit()
+    return cur.lastrowid
+
+
+def test_legacy_recovers_tallies_from_settlement_event():
+    """旧库已结算记录：升级时从对应 poll_settled 事件恢复固定票数——
+    哪怕残余选票已被级联删成矛盾分布，恢复的仍是事件里的结算当时票数。"""
+    with tempfile.TemporaryDirectory() as d:
+        path = os.path.join(d, "t.db")
+        conn = open_db(path)
+        rid, _ = make_room(conn)
+        # 旧版结算当时：A、B 各一票，平票 A 获胜
+        poll, opts, (ga, gb) = _settled_row_legacy(
+            conn, rid, votes=(("红队", "RRR121", 0), ("蓝队", "BBB122", 1)))
+        oa, ob = opts
+        ev_id = _add_poll_settled_event(
+            conn, rid, poll, opts,
+            tallies=((oa["id"], 1), (ob["id"], 1)),
+            votes=((ga, oa["id"]), (gb, ob["id"])))
+        # 升级后红队被删：残余只剩 B 一票（旧矛盾现场）
+        conn.execute("DELETE FROM groups WHERE id=?", (ga,))
+        conn.commit()
+
+        dbmod.init_schema(conn)  # 旧库启动：建 poll_results + 从事件恢复
+        fixed = pm.fixed_result(conn, poll["id"])
+        assert fixed is not None and fixed.recoverable is True
+        assert fixed.recovered_from_event == ev_id
+        fixed_tallies = {t["option_id"]: t["count"] for t in fixed.tallies}
+        assert fixed_tallies == {oa["id"]: 1, ob["id"]: 1}
+        assert len(fixed.votes) == 2  # 逐组选票也按事件恢复（含已删组的历史票）
+
+        # 幂等：再次 init_schema 不重复插入、不改恢复来源
+        dbmod.init_schema(conn)
+        n = conn.execute("SELECT COUNT(*) c FROM poll_results WHERE poll_id=?",
+                         (poll["id"],)).fetchone()["c"]
+        assert n == 1
+        conn.close()
+    print("ok: legacy settled poll recovers tallies from poll_settled event")
+
+
+def test_legacy_missing_event_keeps_winner_marks_unrecoverable():
+    """结算事件缺失：不得用残余选票伪造票数——只保留获胜项，
+    recoverable=0、tallies/votes 为空，由读取侧明确标示票数不可恢复。"""
+    with tempfile.TemporaryDirectory() as d:
+        path = os.path.join(d, "t.db")
+        conn = open_db(path)
+        rid, _ = make_room(conn)
+        # 残余选票：只剩 B 一票（A 的票随组被级联删除）；旧版固定的获胜项是 A
+        poll, opts, (gb,) = _settled_row_legacy(
+            conn, rid, votes=(("蓝队", "BBB131", 1),))
+        oa, ob = opts
+
+        dbmod.init_schema(conn)  # 无 poll_settled 事件可恢复
+        fixed = pm.fixed_result(conn, poll["id"])
+        assert fixed is not None and fixed.recoverable is False
+        assert fixed.recovered_from_event is None
+        assert fixed.tallies == [] and fixed.votes == []
+        row = conn.execute("SELECT * FROM polls WHERE id=?", (poll["id"],)).fetchone()
+        assert row["winner_option_id"] == oa["id"]  # 获胜项保留
+        assert row["status"] == "settled"
+        # 残余选票原样未动（读取侧不得拿它重算）
+        residual = conn.execute(
+            "SELECT option_id FROM poll_votes WHERE poll_id=?", (poll["id"],)).fetchall()
+        assert [r["option_id"] for r in residual] == [ob["id"]]
+        conn.close()
+    print("ok: missing settlement event keeps winner, marks tallies unrecoverable")
+
+
+def test_poll_results_cascade_with_room():
+    """删除房间：固定快照随投票级联清理。"""
+    with tempfile.TemporaryDirectory() as d:
+        conn = open_db(os.path.join(d, "t.db"))
+        rid, _ = make_room(conn)
+        g1 = add_group(conn, rid, "红队", "RRR141")
+        poll = make_poll(conn, rid, ["A", "B"], [g1], 10_000)
+        oa, _ = pm.poll_options(conn, poll["id"])
+        pm.cast_vote(conn, poll, g1, oa["id"])
+        pm.settle_due_polls(conn, rid, 0, 10_000)
+        assert conn.execute("SELECT COUNT(*) c FROM poll_results").fetchone()["c"] == 1
+        conn.execute("DELETE FROM rooms WHERE id=?", (rid,))
+        conn.commit()
+        assert conn.execute("SELECT COUNT(*) c FROM poll_results").fetchone()["c"] == 0
+        conn.close()
+    print("ok: poll_results cascade with room deletion")
+
+
+def test_legacy_duplicate_settlement_events_picks_one():
+    """同一投票若存在多条 poll_settled 事件（异常/手工重复写入），恢复确定性
+    取最早一条且只写一行 poll_results，不因 JOIN 扇出而撞主键。"""
+    with tempfile.TemporaryDirectory() as d:
+        path = os.path.join(d, "t.db")
+        conn = open_db(path)
+        rid, _ = make_room(conn)
+        poll, opts, (ga, gb) = _settled_row_legacy(
+            conn, rid, votes=(("红队", "RRR151", 0), ("蓝队", "BBB152", 1)))
+        oa, ob = opts
+        payload_tallies = ((oa["id"], 1), (ob["id"], 1))
+        payload_votes = ((ga, oa["id"]), (gb, ob["id"]))
+        ev1 = _add_poll_settled_event(conn, rid, poll, opts,
+                                      payload_tallies, payload_votes)
+        _add_poll_settled_event(conn, rid, poll, opts,
+                                payload_tallies, payload_votes)  # 重复事件
+        dbmod.init_schema(conn)
+        rows = conn.execute("SELECT * FROM poll_results WHERE poll_id=?",
+                            (poll["id"],)).fetchall()
+        assert len(rows) == 1 and rows[0]["recoverable"] == 1
+        assert rows[0]["recovered_from_event"] == ev1  # 取最早一条
+        conn.close()
+    print("ok: duplicate settlement events recover one row from earliest event")
+
+
 if __name__ == "__main__":
     test_create_and_option_bounds()
     test_one_vote_per_group_and_change()
@@ -381,4 +609,10 @@ if __name__ == "__main__":
     test_cascade_delete_group_and_room()
     test_restart_freezes_running_room_and_polls_survive()
     test_legacy_schema_includes_poll_tables()
+    test_settled_tallies_fixed_survive_group_delete()
+    test_fixed_result_survives_restart_reconnect()
+    test_legacy_recovers_tallies_from_settlement_event()
+    test_legacy_missing_event_keeps_winner_marks_unrecoverable()
+    test_legacy_duplicate_settlement_events_picks_one()
+    test_poll_results_cascade_with_room()
     print("ALL POLL TESTS PASSED")
